@@ -11,9 +11,11 @@ This project demonstrates an analogue clock on a GC9A01 round display unit using
 # Features
 - NTP synced clock
 - offline mode with high precision (2ppm) RTC module
-- ambient sensor to fade display brightness at night
+- ambient light sensor to control display backlight
 - 2 different clock face (Big Ben and Mondaine)
-- settings through web UI (with STA mode if there is no AP to connect)
+- clock settings through web UI (with STA mode if there is no AP to connect)
+- OTA firmware upgrade
 
 # Circuit
-TODO...
+<img width="1020" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_bb.png">
+<img width="1020" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_schem.png">

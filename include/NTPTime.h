@@ -27,6 +27,8 @@
 // A UDP instance to let us send and receive packets over UDP
 WiFiUDP udp;
 
+tmElements_t actualNTPTime;
+
 //====================================================================================
 //                                  Settings
 //====================================================================================

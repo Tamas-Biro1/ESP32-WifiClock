@@ -1,34 +1,24 @@
-#include "assets.h"
+#include <assets.h>
+#include <common.h>
+#include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <HTTPUpdateServer.h>
 #include <EEPROM.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
-#include "Time.h"
-#include <DS3232RTC.h>      // https://github.com/JChristensen/DS3232RTC
+#include <soc/soc.h>
+#include <soc/rtc_cntl_reg.h>
+#include <Time.h>
+#include <DS3232RTC.h>
 #include <BH1750.h>
 #include <SD.h>
-
-// SPI2 on ESP32 S2 Mini for the IPS display
-/* configuration for TFT_eSPI library
-#define USE_HSPI_PORT
-#define TFT_MISO 13
-#define TFT_MOSI 14
-#define TFT_SCLK 10
-#define TFT_CS    8
-#define TFT_DC    4
-#define TFT_RST   6
-*/
+#include "NTPTime.h"
 
 // SPI3 on ESP32 S2 Mini for the SD card
 #define SD_MOSI_PIN 34   // SPI master out, slave in
 #define SD_MISO_PIN 36   // SPI master in, slave out
 #define SD_SCK_PIN 38    // SPI clock
 #define SD_CS_PIN 40     // SPI chip select for SD card reader
-#define DSP_CS_PIN 8     // SPI chip select for IPS display
-#define DSP_DC_PIN 4     // SPI data/command for IPS display
 
 // I2C for RTC Clock and Ligth sensor
 #define I2C_SDA_PIN 17    // I2C data pin
@@ -48,8 +38,8 @@
 #define MINUTE_ANGLE SECOND_ANGLE / 60.0
 #define HOUR_ANGLE   MINUTE_ANGLE / 12.0
 
-#define AMBIENT_LIGHT_MEASURE_INTERVAL 5000   // ms
-#define AMBIENT_LIGHT_TRESHOLD_MAXIMUM 5.0   // <5.0 means lower LCD backlight intensity
+#define AMBIENT_LIGHT_TRESHOLD_MAXIMUM 2.0
+#define AMBIENT_LIGHT_MEASUREMENT_COUNT 50
 
 // variables
 CLOCK_FACE clockFace;
@@ -57,11 +47,11 @@ DS3232RTC rtc;
 BH1750 lightMeter;
 File configFile;
 tmElements_t actualRTCTime;
-tmElements_t actualNTPTime;
 WebServer server(80);
 HTTPUpdateServer httpUpdater;
 String wifiSSID = "";
 String wifiPass = "";
+SPIClass& SD_SPI = SPI;
 
 // sprite and screen variables
 TFT_eSPI    tft = TFT_eSPI();
@@ -89,9 +79,6 @@ volatile time_t isrCurrentTime;           // store ISR's current time
 // this is the primary time source
 float internalTimeSecs = 0 * 3600 + 0 * 60 + 0;
 
-// Load header after "actualNTPTime" global variable has been created so it is in scope
-#include "NTP_Time.h"
-
 void setup()
 {
   // disable brownout detector during startup
@@ -99,7 +86,7 @@ void setup()
 
   // start serial debug
   Serial.begin(115200);
-  delay(1000);  // wait for serial to come up (temporary bugfix for slow serial)
+  delay(3000);  // wait for serial to come up (temporary bugfix for slow serial)
 
   // Wifi indicator
   Serial.println("Boot started...");
@@ -115,9 +102,9 @@ void setup()
   Serial.println("Backlight PWM configured.");
 
   // initialize SD card
-  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
+  SD_SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
   Serial.println("SPI bus initialized");
-  if (! SD.begin(SD_CS_PIN, SPI)) {
+  if (! SD.begin(SD_CS_PIN, SD_SPI)) {
     Serial.println("SD card initialization failed!");
     hasSD = false;
   } else {
@@ -284,9 +271,30 @@ void blinkWifiLed() {
   }
 }
 
+// update measurements array with new values
+float lightMeasurements[AMBIENT_LIGHT_MEASUREMENT_COUNT] = {0};
+int measurementIndex = 0;
+bool ambientLightArrayFilled = false;
+void updateLightMeasurements(float newMeasurement) {
+  lightMeasurements[measurementIndex] = newMeasurement;
+  measurementIndex = (measurementIndex + 1) % AMBIENT_LIGHT_MEASUREMENT_COUNT;
+  if (measurementIndex == 0) {
+    ambientLightArrayFilled = true;
+  }
+}
+
+// get avg light level from measurements array
+float getAverageLightLevel() {
+  float sum = 0;
+  int count = ambientLightArrayFilled ? AMBIENT_LIGHT_MEASUREMENT_COUNT : measurementIndex;
+  for (int i = 0; i < count; i++) {
+    sum += lightMeasurements[i];
+  }
+  return sum / count;
+}
+
 // main function
-void loop(void)
-{
+void loop(void) {
   unsigned long currentTimeMillis;
 
   server.handleClient();
@@ -332,24 +340,30 @@ void loop(void)
 
   delay(10);
 
-  // measure ambient light intensity in every AMBIENT_LIGHT_MEASURE_INTERVAL
-  currentTimeMillis = millis();
-  if (currentTimeMillis - previousLightMeasureMillis >= AMBIENT_LIGHT_MEASURE_INTERVAL) {
-    previousLightMeasureMillis = currentTimeMillis;
-    debugRTC();
-    float measuredLightInLux = lightMeter.readLightLevel();
-    if(measuredLightInLux >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM)
-      measuredLightInLux = AMBIENT_LIGHT_TRESHOLD_MAXIMUM;
-    Serial.print("Light: ");
-    Serial.print(measuredLightInLux);
-    Serial.println(" lux");
-    ledcWrite(0, (measuredLightInLux) / AMBIENT_LIGHT_TRESHOLD_MAXIMUM * 1024.0);
+  float lightLevel = lightMeter.readLightLevel();
+  Serial.print("Light: ");
+  Serial.print(lightLevel);
+  Serial.println(" lx");
+
+  // update light measurements array
+  updateLightMeasurements(lightLevel);
+
+  // calculate average light level
+  float avgLightLevel = getAverageLightLevel();
+  Serial.print("Average Light: ");
+  Serial.print(avgLightLevel);
+  Serial.println(" lx");
+
+  // control backlight based on average light level
+  if (avgLightLevel >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM) {
+    ledcWrite(0, 1023);
+  } else {
+    ledcWrite(0, 0);
   }
 }
 
 // render clock hands positions on display
-void renderFace(float t)
-{
+void renderFace(float t) {
   float h_angle = t * HOUR_ANGLE;
   float m_angle = t * MINUTE_ANGLE;
   float s_angle = t * SECOND_ANGLE; 

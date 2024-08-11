@@ -142,23 +142,8 @@ void sendNTPpacket(IPAddress& address);
 bool syncTime(void)
 {
   if (ntp_start) {  // Run once
-
-    // Call once for ESP32 and ESP8266
-    /* DO NOT CALL WIFI HERE
-    #if !defined(ARDUINO_ARCH_MBED)
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    #endif
-
-    while (WiFi.status() != WL_CONNECTED) {
-      Serial.print(".");
-      #if defined(ARDUINO_ARCH_MBED) || defined(ARDUINO_ARCH_RP2040)
-      if (WiFi.status() != WL_CONNECTED) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      #endif
-      delay(500);
-    }
-    Serial.println(); */
-
-    udp.begin(localPort); ntp_start = 0;
+    udp.begin(localPort);
+    ntp_start = 0;
   }
 
   // Don't send too often so we don't trigger Denial of Service

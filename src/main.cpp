@@ -20,7 +20,7 @@
 #define SD_SCK_PIN 38    // SPI clock
 #define SD_CS_PIN 40     // SPI chip select for SD card reader
 
-// I2C for RTC Clock and Ligth sensor
+// I2C for RTC Clock and Light sensor
 #define I2C_SDA_PIN 17    // I2C data pin
 #define I2C_SCL_PIN 21    // I2C clock
 #define RTC_1HZ_PIN 1     // DS3231 RTC provides a 1Hz interrupt signal on SQW to this pin
@@ -41,7 +41,9 @@
 #define AMBIENT_LIGHT_TRESHOLD_MAXIMUM 2.0
 #define AMBIENT_LIGHT_MEASUREMENT_COUNT 50
 
-// variables
+#define WIFI_WAIT_TIMEOUT_MILLISEC 10000
+
+// global variables
 CLOCK_FACE clockFace;
 DS3232RTC rtc;
 BH1750 lightMeter;
@@ -52,113 +54,260 @@ HTTPUpdateServer httpUpdater;
 String wifiSSID = "";
 String wifiPass = "";
 SPIClass& SD_SPI = SPI;
+const char* hostName = "wificlock";     // wificlock.local will be the config page
+unsigned char weekDays[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+float internalTimeSecs = 0 * 3600 + 0 * 60 + 0;
+bool wifiLedState = false;
+bool hasSD = true;
+unsigned long previousWifiLedMillis = 0;
+volatile time_t isrCurrentTime;
 
-// sprite and screen variables
-TFT_eSPI    tft = TFT_eSPI();
+TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite bgSprite = TFT_eSprite(&tft);
 TFT_eSprite hourHandSprite = TFT_eSprite(&tft);
 TFT_eSprite minuteHandSprite = TFT_eSprite(&tft);
 TFT_eSprite secondHandSprite = TFT_eSprite(&tft);
 
-// variables
-const char* hostName = "wificlock";     // <hostName>.local will be the config page
-unsigned char weekDays[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-unsigned char clockFaceID = 0;
-bool wifiLedState = false;
-bool hasSD = true;
-unsigned long previousWifiLedMillis = 0;
-unsigned long previousLightMeasureMillis = 0;
-unsigned long wifiWaitTimeout = 10000;
-float measuredLightInLux = 0.0;
-uint32_t nextClockFaceUpdateMillis = 0;   // interval to update clock hands positions
-volatile time_t isrCurrentTime;           // store ISR's current time
+// light measurement array
+float lightMeasurements[AMBIENT_LIGHT_MEASUREMENT_COUNT] = {0};
+int measurementIndex = 0;
+bool ambientLightArrayFilled = false;
 
-// "internalTimeSecs" is used to move clock hands smoothly (100msec)
-// since RTC can provide time only in every 1 sec
-// we have to use a variable to calculate seconds hand position in between
-// this is the primary time source
-float internalTimeSecs = 0 * 3600 + 0 * 60 + 0;
+// function prototypes
+void debugTask(void *pvParameters);
+void clockTask(void *pvParameters);
+void wifiTask(void *pvParameters);
+void lightTask(void *pvParameters);
+void ntpTask(void *pvParameters);
+void renderFace(float t);
+void updateLightMeasurements(float newMeasurement);
+float getAverageLightLevel();
+void startWifiAPMode();
+void handleRoot();
+void handleClockFaceSetting();
+void handleSetTimeSetting();
+void handleWifiCredsSetting();
+String readFile(String fileName);
+void writeFileToSDCard(String filename, String content);
+time_t getISRTimeVar();
+void setISRTimeVar(time_t t);
+bool initSDCard();
+void initDisplay();
+void incrementTime();
 
-void setup()
-{
-  // disable brownout detector during startup
+// The setup function where tasks are created
+void setup() {
+  // Disable brownout detector during startup
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-  // start serial debug
+  // Start serial debug
   Serial.begin(115200);
-  delay(3000);  // wait for serial to come up (temporary bugfix for slow serial)
-
-  // Wifi indicator
   Serial.println("Boot started...");
   Serial.println("Brownout disabled.");
+
+  // initialize SD card, load settings
+  hasSD = initSDCard();
+
+  // initialize I2C bus with custom SDA and SCL pins
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // configure RTC
+  pinMode(RTC_1HZ_PIN, INPUT_PULLUP);     // enable pullup on interrupt pin (SQW pin is open drain)
+  attachInterrupt(digitalPinToInterrupt(RTC_1HZ_PIN), incrementTime, FALLING);    // set interrupt handler func
+  rtc.begin();                              // start RTC communication on I2C
+  rtc.squareWave(DS3232RTC::SQWAVE_1_HZ);   // set 1 Hz square wave output on SQW pin
+
+  // ensure the ISR time variable is set with valid time on startup
+  time_t t = getISRTimeVar();
+  while (t == getISRTimeVar());             // wait for the next second (ISR trigger)
+  t = rtc.get();                            // get the time from the RTC
+  setISRTimeVar(t);                         // store ISR time to variable
+  Serial.println("Time set from RTC");
+
+  // look for light sensor on I2C bus
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  Serial.println(F("BH1750 initialized."));
+
+  // create FreeRTOS tasks
+  xTaskCreatePinnedToCore(debugTask, "Debug Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(clockTask, "Clock Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(wifiTask, "WiFi Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(lightTask, "Light Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(ntpTask, "NTP Task", 8192, NULL, 1, NULL, 0);
+
+  // enable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1);
+  Serial.println("Brownout enabled.");
+}
+
+// The loop function is no longer needed with FreeRTOS
+void loop() {}
+
+/* define FreeRTOS tasks */
+// task to print debug variables
+void debugTask(void *pvParameters) {
+  for (;;) {
+    debugRTC();
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// task to update the clock face and hands
+void clockTask(void *pvParameters) {  
+  // init display and draw sprites
+  initDisplay();
+
+  // start running clock updater
+  for (;;) {
+    time_t t = getISRTimeVar();
+    actualRTCTime.Hour = hour(t);
+    actualRTCTime.Minute = minute(t);
+    actualRTCTime.Second = second(t);
+    internalTimeSecs = actualRTCTime.Hour * 3600 + actualRTCTime.Minute * 60 + actualRTCTime.Second;
+
+    renderFace(internalTimeSecs);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// task to handle WiFi connection and server management
+void wifiTask(void *pvParameters) {
+  // Wifi status led (disabled)
   pinMode(WIFI_LED_PIN, OUTPUT);
   digitalWrite(WIFI_LED_PIN, LOW);
 
-  // configure PWM to drive IPS LCD backlight
-  ledcSetup(0, 5000, 10);          // PWM channel0 with 1kHz and 10bit resolution
-  ledcAttachPin(LCD_BL_PIN, 0);    // assigns PWM channel0 LCD_BL_PIN
-  ledcWrite(0, 1023);              // initial value is 1023, which equals ~3.3V
+  // try to connect to AP with SSID:PASSWORD, if fails fall back to STA mode
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    Serial.println("Trying to connect to WiFi...");
+    if (millis() - startTime > WIFI_WAIT_TIMEOUT_MILLISEC) {
+      Serial.println("Failed to connect to WiFi, skipping on start...");
+      startWifiAPMode();
+      break;
+    }
+  }
 
-  Serial.println("Backlight PWM configured.");
+  // configure callback functions
+  server.on("/", handleRoot);
+  server.on("/clockface", handleClockFaceSetting);
+  server.on("/settime", handleSetTimeSetting);
+  server.on("/setwificreds", handleWifiCredsSetting);
 
-  // initialize SD card
+  // start mDNS responder
+  MDNS.begin("wificlock");
+  if (MDNS.begin("wificlock")) {
+    Serial.println("mDNS responder started");
+  }
+  
+  // start http server
+  httpUpdater.setup(&server);
+  server.begin();
+  Serial.println("HTTP server started");
+  MDNS.addService("http", "tcp", 80);
+
+  // start listener task
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// task to handle light measurement and backlight control
+void lightTask(void *pvParameters) {
+  // init display backlight
+  pinMode(LCD_BL_PIN, OUTPUT);
+  digitalWrite(LCD_BL_PIN, HIGH);
+  Serial.println("Backlight pin configured.");
+
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  Serial.println(F("BH1750 initialized."));
+
+  for (;;) {
+    float lightLevel = lightMeter.readLightLevel();
+    Serial.print("Light: ");
+    Serial.print(lightLevel);
+    Serial.println(" lx");
+    updateLightMeasurements(lightLevel);
+    float avgLightLevel = getAverageLightLevel();
+    Serial.print("Average Light: ");
+    Serial.print(avgLightLevel);
+    Serial.println(" lx");
+
+    if (avgLightLevel >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM) {
+      digitalWrite(LCD_BL_PIN, HIGH);
+    } else {
+      digitalWrite(LCD_BL_PIN, LOW);
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// task to synchronise local RTC with NTP
+void ntpTask(void *pvParameters) {
+  udp.begin(localPort);
+
+  const TickType_t xDelay = pdMS_TO_TICKS(3600000);
+  for (;;) {
+    // if Wifi is connected, update the RTC chip clock
+    if (WiFi.status() == WL_CONNECTED) {
+      // decodeNTP() updates "actualNTPTime" local variable with NTP time
+      WiFi.hostByName(ntpServerName, timeServerIP);
+      sendNTPpacket(timeServerIP); // send an NTP packet to a time server
+      decodeNTP();
+      
+      if ( no_packet_count > 0 )  {
+        nextSendTime = millis() + 60 * 1000;
+        Serial.println("Failed to synchronize with NTP, retrying in 1 minute.");
+      } else {
+        rtc.set(makeTime(actualNTPTime));
+        Serial.println("RTC was updated using NTP time.");
+      }
+    } else {
+      Serial.println("WiFi not connected, skipping NTP sync.");
+    }
+
+    // delay task for 1 hour
+    vTaskDelay(xDelay);
+  }
+}
+
+/* define functions */
+// initialize SD card, load settings
+bool initSDCard() {
   SD_SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
   Serial.println("SPI bus initialized");
   if (! SD.begin(SD_CS_PIN, SD_SPI)) {
     Serial.println("SD card initialization failed!");
-    hasSD = false;
-  } else {
-    Serial.println("SD card initialization done.");
+    return false;
+  }
+  Serial.println("SD card initialization done, loading settings...");
+
+  // read clock face
+  String clockFaceSetting = readFile("/clockfaceconf");
+  if(clockFaceSetting != "") {
+    clockFace = CLOCK_FACES[clockFaceSetting.toInt()];
   }
 
-  // set default clock face
-  clockFace = CLOCK_FACES[clockFaceID];
-
-  if(hasSD)
-  {
-    // read clock face setting from SD
-    String clockFaceSetting = readFile("/clockfaceconf");
-    if(clockFaceSetting != "") {
-      // set clock face
-      clockFace = CLOCK_FACES[clockFaceSetting.toInt()];
+  // read Wifi credentials for connecting to AP
+  String wifiCredentials = readFile("/wificonf");
+  if (wifiCredentials != "") {
+    int colonPos = wifiCredentials.indexOf(':');
+    if (colonPos != -1) {
+      wifiSSID = wifiCredentials.substring(0, colonPos);
+      wifiPass = wifiCredentials.substring(colonPos + 1);
+      Serial.println(wifiSSID + " " + wifiPass);
+    } else {
+      Serial.println("Error: Wifi credential must be in 'SSID:PASSWORD' format!");
     }
-
-
-    // read Wifi credentials from SD (if there is any)
-    String wifiCredentials = readFile("/wificonf");
-    if(wifiCredentials != "") {
-      // find the position of the colon character
-      int colonPos = wifiCredentials.indexOf(':');
-      if (colonPos != -1)
-      {
-        wifiSSID = wifiCredentials.substring(0, colonPos);
-        wifiPass = wifiCredentials.substring(colonPos + 1);
-        Serial.println(wifiSSID + " " + wifiPass);
-      } else {
-        Serial.println("Error: Wifi credential must be in 'SSID:PASSWORD' format!");
-      }
-    }
-
-    // configure Wifi
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-
-    // wait for Wifi
-    unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(1000);
-      Serial.println("Trying to connect to WiFi...");
-      if (millis() - startTime > wifiWaitTimeout) {
-        Serial.println("Failed to connect to WiFi, skipping on start...");
-        startWifiAPMode();
-        break;
-      }
-    }
-  } else {
-    startWifiAPMode();
   }
+  return true;
+}
 
-  // initialise TFT
+// initialize TFT
+void initDisplay() {
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_WHITE);
@@ -199,59 +348,6 @@ void setup()
   secondHandSprite.setPivot(clockFace.SECOND_HAND_CENTER_X, clockFace.SECOND_HAND_CENTER_Y);
   secondHandSprite.pushImage(0, 0, clockFace.SECOND_HAND_WIDTH, clockFace.SECOND_HAND_HEIGHT, clockFace.SECOND_HAND);
   secondHandSprite.pushSprite((WIDTH / 2) - clockFace.SECOND_HAND_CENTER_X, (HEIGHT/2) - clockFace.SECOND_HAND_CENTER_Y, TFT_BLUE);
-
-  // initialize I2C bus with custom SDA and SCL pins
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-
-  // configure RTC
-  pinMode(RTC_1HZ_PIN, INPUT_PULLUP);     // enable pullup on interrupt pin (SQW pin is open drain)
-  attachInterrupt(digitalPinToInterrupt(RTC_1HZ_PIN), incrementTime, FALLING);    // set interrupt handler func
-  rtc.begin();                              // start RTC communication on I2C
-  rtc.squareWave(DS3232RTC::SQWAVE_1_HZ);   // set 1 Hz square wave output on SQW pin
-
-  // ensure the ISR time variable is set with valid time on startup
-  time_t t = getISRTimeVar();
-  while (t == getISRTimeVar());             // wait for the next second (ISR trigger)
-  t = rtc.get();                            // get the time from the RTC
-  setISRTimeVar(t);                         // store ISR time to variable
-  Serial.println("Time set from RTC");
-
-  // look for light sensor on I2C bus
-  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-  Serial.println(F("BH1750 initialized."));
-  Serial.print("IP address: ");
-  if(hasSD)
-    Serial.println(WiFi.localIP());
-  else
-    Serial.println(WiFi.softAPIP());
-  
-  server.on("/", handleRoot);
-  server.on("/clockface", handleClockFaceSetting);
-  server.on("/settime", handleSetTimeSetting);
-  server.on("/setwificreds", handleWifiCredsSetting);
-
-  MDNS.begin(hostName);
-  if (MDNS.begin(hostName)) {
-    Serial.println("mDNS responder started");
-  }
-  httpUpdater.setup(&server);
-  server.begin();
-  Serial.println("HTTP server started");
-  MDNS.addService("http", "tcp", 80);
-
-  delay(50);
-
-  // enable brownout detector
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1);
-  Serial.println("Brownout enabled.");
-  Serial.println("WifiClock is ready.");
-
-  // set next clock face update time
-  nextClockFaceUpdateMillis = millis() + 100;
-
-  // debug
-  Serial.printf("Free heap memory: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("PSRAM Total heap %d, PSRAM Free Heap %d\n",ESP.getPsramSize(),ESP.getFreePsram());
 }
 
 // start Wifi in AP mode
@@ -272,9 +368,6 @@ void blinkWifiLed() {
 }
 
 // update measurements array with new values
-float lightMeasurements[AMBIENT_LIGHT_MEASUREMENT_COUNT] = {0};
-int measurementIndex = 0;
-bool ambientLightArrayFilled = false;
 void updateLightMeasurements(float newMeasurement) {
   lightMeasurements[measurementIndex] = newMeasurement;
   measurementIndex = (measurementIndex + 1) % AMBIENT_LIGHT_MEASUREMENT_COUNT;
@@ -291,75 +384,6 @@ float getAverageLightLevel() {
     sum += lightMeasurements[i];
   }
   return sum / count;
-}
-
-// main function
-void loop(void) {
-  unsigned long currentTimeMillis;
-
-  server.handleClient();
-  /* if(WiFi.status() == WL_CONNECTED) {
-      blinkWifiLed();
-  }*/
-  delay(10);
-
-  // if Wifi is connected, update the RTC chip clock
-  if (WiFi.status() == WL_CONNECTED) {
-    // syncTime() runs every 1 hour and updates "actualNTPTime" variable with NTP time
-    if(syncTime()) {
-      rtc.set(makeTime(actualNTPTime));     // update RTC chip time with NTP time
-      Serial.println("RTC was updated using NTP time.");
-    }
-  }
-
-  // update "internalTimeSecs" when it changed since previous check
-  static time_t tLast;
-  time_t t = getISRTimeVar();
-  if (t != tLast) {
-    tLast = t;
-    actualRTCTime.Hour = hour(t);
-    actualRTCTime.Minute = minute(t);
-    actualRTCTime.Second = second(t);
-    internalTimeSecs = actualRTCTime.Hour * 3600 + actualRTCTime.Minute * 60 + actualRTCTime.Second;
-  }
-  
-  // update clock hands in every 100ms using "internalTimeSecs"
-  if (nextClockFaceUpdateMillis < millis()) {
-    //set next tick time in 100 milliseconds (smooth movement)
-    nextClockFaceUpdateMillis = millis() + 100;
-
-    // increment time by 100 milliseconds
-    internalTimeSecs += 0.100;
-
-    // midnight transition
-    if (internalTimeSecs >= (60 * 60 * 24)) internalTimeSecs = 0;
-   
-    // draw updated clock hands positions (hour, min, sec)
-    renderFace(internalTimeSecs);
-  } 
-
-  delay(10);
-
-  float lightLevel = lightMeter.readLightLevel();
-  Serial.print("Light: ");
-  Serial.print(lightLevel);
-  Serial.println(" lx");
-
-  // update light measurements array
-  updateLightMeasurements(lightLevel);
-
-  // calculate average light level
-  float avgLightLevel = getAverageLightLevel();
-  Serial.print("Average Light: ");
-  Serial.print(avgLightLevel);
-  Serial.println(" lx");
-
-  // control backlight based on average light level
-  if (avgLightLevel >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM) {
-    ledcWrite(0, 1023);
-  } else {
-    ledcWrite(0, 0);
-  }
 }
 
 // render clock hands positions on display
@@ -462,6 +486,10 @@ void handleWifiCredsSetting() {
 // read the first line of the given file
 String readFile(String fileName) {
   String firstLine = "";
+  if (!SD.begin(SD_CS_PIN, SD_SPI)) {
+    Serial.println("SD card initialization failed.");
+    return firstLine;
+  }
   configFile = SD.open(fileName, FILE_READ);
   if (configFile) {
     firstLine = configFile.readStringUntil('\n');
@@ -474,7 +502,7 @@ String readFile(String fileName) {
 
 // write file with content to the SD
 void writeFileToSDCard(String filename, String content) {
-  if (!SD.begin(SD_CS_PIN)) {
+  if (!SD.begin(SD_CS_PIN, SD_SPI)) {
     Serial.println("SD card initialization failed.");
     return;
   }

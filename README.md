@@ -1,18 +1,18 @@
-# ESP32-WifiClock
+## ESP32-WifiClock
 This project demonstrates an analogue clock on a GC9A01 round display unit using ESP32-S2 mini (Wemos S2 mini) system controller.
 <p align="center">
   <img width="160" alt="image" src="https://github.com/user-attachments/assets/d7534c29-989a-427b-a624-1458e9de1650">
   <img width="160" alt="image" src="https://github.com/user-attachments/assets/cdd3b507-7d43-4c49-8c90-479c2cf2526d">
 </p>
 
-# Components
+## Components
 - GC9A01 round display (https://www.makerfabs.com/gc9a01-1-28-inch-round-lcd-module.html) - this variant has BLK pin to control the backlight intensity (I²C)
 - ESP32-S2 mini (https://www.wemos.cc/en/latest/s2/s2_mini.html) - S2FN4R2, with 2MB PSRAM and 4MB Flash
 - DS3232 battery backed (CR2025) real time clock (I²C)
 - BH1750 light sensor (I²C)
 - SD Card reader (SPI)
 
-# Features
+## Features
 - NTP synced clock
 - offline mode with high precision (2ppm) RTC module
 - ambient light sensor to control display backlight
@@ -22,6 +22,8 @@ This project demonstrates an analogue clock on a GC9A01 round display unit using
 - OTA firmware upgrade
 - FreeRTOS task handling are used
 
-# Circuit
-<img width="1020" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_bb.png">
-<img width="1020" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_schem.png">
+## Circuit
+<p align="center">
+  <img width="800" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_bb.png">
+  <img width="800" alt="image" src="https://github.com/Tamas-Biro1/ESP32-WifiClock/blob/main/assets/github/esp32-wificlock_schem.png">
+</p>

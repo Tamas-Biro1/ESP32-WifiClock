@@ -13,6 +13,7 @@
 #include <BH1750.h>
 #include <SD.h>
 #include "NTPTime.h"
+#include "web_ui.h"
 
 // SPI3 on ESP32 S2 Mini for the SD card
 #define SD_MOSI_PIN 34   // SPI master out, slave in
@@ -45,6 +46,7 @@
 
 // global variables
 CLOCK_FACE clockFace;
+int clockFaceIndex = 0;
 DS3232RTC rtc;
 BH1750 lightMeter;
 File configFile;
@@ -87,6 +89,7 @@ void handleRoot();
 void handleClockFaceSetting();
 void handleSetTimeSetting();
 void handleWifiCredsSetting();
+void handleOtaPage();
 String readFile(String fileName);
 void writeFileToSDCard(String filename, String content);
 time_t getISRTimeVar();
@@ -153,16 +156,17 @@ void debugTask(void *pvParameters) {
 }
 
 // task to update the clock face and hands
-void clockTask(void *pvParameters) {  
+void clockTask(void *pvParameters) {
   // init display and draw sprites
   initDisplay();
 
   // start running clock updater
   for (;;) {
-    time_t t = getISRTimeVar();
-    actualRTCTime.Hour = hour(t);
-    actualRTCTime.Minute = minute(t);
-    actualRTCTime.Second = second(t);
+    // isrCurrentTime holds UTC; convert to local time so DST is always applied correctly
+    time_t localNow = euCET.toLocal(getISRTimeVar());
+    actualRTCTime.Hour = hour(localNow);
+    actualRTCTime.Minute = minute(localNow);
+    actualRTCTime.Second = second(localNow);
     internalTimeSecs = actualRTCTime.Hour * 3600 + actualRTCTime.Minute * 60 + actualRTCTime.Second;
 
     renderFace(internalTimeSecs);
@@ -195,6 +199,7 @@ void wifiTask(void *pvParameters) {
   server.on("/clockface", handleClockFaceSetting);
   server.on("/settime", handleSetTimeSetting);
   server.on("/setwificreds", handleWifiCredsSetting);
+  server.on("/ota", handleOtaPage);
 
   // start mDNS responder
   MDNS.begin("wificlock");
@@ -249,28 +254,27 @@ void lightTask(void *pvParameters) {
 void ntpTask(void *pvParameters) {
   udp.begin(localPort);
 
-  const TickType_t xDelay = pdMS_TO_TICKS(3600000);
   for (;;) {
-    // if Wifi is connected, update the RTC chip clock
     if (WiFi.status() == WL_CONNECTED) {
-      // decodeNTP() updates "actualNTPTime" local variable with NTP time
+      // decodeNTP() sets the global 'utc' variable with the UTC time from NTP
       WiFi.hostByName(ntpServerName, timeServerIP);
-      sendNTPpacket(timeServerIP); // send an NTP packet to a time server
+      sendNTPpacket(timeServerIP);
       decodeNTP();
-      
-      if ( no_packet_count > 0 )  {
-        nextSendTime = millis() + 60 * 1000;
+
+      if (no_packet_count > 0) {
         Serial.println("Failed to synchronize with NTP, retrying in 1 minute.");
+        vTaskDelay(pdMS_TO_TICKS(60000)); // retry in 1 minute
       } else {
-        rtc.set(makeTime(actualNTPTime));
-        Serial.println("RTC was updated using NTP time.");
+        // Store UTC in RTC so DST conversion always uses the current rule at display time
+        rtc.set(utc);
+        setISRTimeVar(utc);
+        Serial.println("RTC and system time updated using NTP (UTC stored).");
+        vTaskDelay(pdMS_TO_TICKS(3600000)); // next sync in 1 hour
       }
     } else {
       Serial.println("WiFi not connected, skipping NTP sync.");
+      vTaskDelay(pdMS_TO_TICKS(10000)); // check again in 10 seconds (fast retry until WiFi is up)
     }
-
-    // delay task for 1 hour
-    vTaskDelay(xDelay);
   }
 }
 
@@ -288,7 +292,8 @@ bool initSDCard() {
   // read clock face
   String clockFaceSetting = readFile("/clockfaceconf");
   if(clockFaceSetting != "") {
-    clockFace = CLOCK_FACES[clockFaceSetting.toInt()];
+    clockFaceIndex = clockFaceSetting.toInt();
+    clockFace = CLOCK_FACES[clockFaceIndex];
   }
 
   // read Wifi credentials for connecting to AP
@@ -402,36 +407,19 @@ void renderFace(float t) {
   bgSprite.pushSprite(0, 0, TFT_BLUE);
 }
 
-// handler function for root page
+// handler function for root page — fills in current settings dynamically
 void handleRoot() {
-  String html = "<!DOCTYPE html><body>";
-  html += "<form action='/clockface' method='POST'>";
-  html += "<label for='radio1'><b>Select clock face:</b></label><br>";
-  html += "<input type='radio' name='radio' value='0' id='radio1'>BigBen<br>";
-  html += "<input type='radio' name='radio' value='1' id='radio2'>SBB Clock<br>";
-  html += "<br><input type='submit' value='Save'>";
-  html += "</form>";
-  html += "<hr><br>";
-  html += "<form action='/settime' method='POST'>";
-  html += "<label for='radio1'><b>Set time:</b></label><br>";
-  html += "<input type='number' size='6' name='year' min='2000' max='2070' value='2023'>Year<br>";
-  html += "<input type='number' size='6' name='month' min='1' max='12' value='1'>Month<br>";
-  html += "<input type='number' size='6' name='day' min='1' max='31' value='1'>Day<br>";
-  html += "<input type='number' size='6' name='hour' min='0' max='23' value='0'>Hour<br>";
-  html += "<input type='number' size='6' name='minute' min='0' max='59' value='0'>Minute<br>";
-  html += "<input type='number' size='6' name='second' min='0' max='59' value='0'>Second<br>";
-  html += "<br><input type='submit' value='Save'>";
-  html += "</form>";
-  html += "<hr><br>";
-  html += "<form action='/setwificreds' method='POST'>";
-  html += "<label for='radio1'><b>Set Wifi credentials for STA mode:</b></label><br>";
-  html += "<input type='text' size='15' name='wifissid'>SSID<br>";
-  html += "<input type='password' size='15' name='wifipasswd'>Password<br>";
-  html += "<br><input type='submit' value='Save'>";
-  html += "</form>";
-  html += "<hr><br>";
-  html += "<button onclick=\"window.location.href='/update';\">Firmware update...</button>";
-  html += "<hr><br>";
+  time_t localNow = euCET.toLocal(getISRTimeVar());
+  String html = String(FPSTR(ROOT_HTML));
+  html.replace("%CF0%", clockFaceIndex == 0 ? "checked" : "");
+  html.replace("%CF1%", clockFaceIndex == 1 ? "checked" : "");
+  html.replace("%YEAR%",   String(year(localNow)));
+  html.replace("%MONTH%",  String(month(localNow)));
+  html.replace("%DAY%",    String(day(localNow)));
+  html.replace("%HOUR%",   String(hour(localNow)));
+  html.replace("%MINUTE%", String(minute(localNow)));
+  html.replace("%SECOND%", String(second(localNow)));
+  html.replace("%SSID%",   wifiSSID);
   server.send(200, "text/html", html);
 }
 
@@ -439,13 +427,11 @@ void handleRoot() {
 void handleClockFaceSetting() {
   if(hasSD)
   {
-    if (server.arg("radio") == "0") {
-      writeFileToSDCard("/clockfaceconf", "0");
-    } else if(server.arg("radio") == "1") {
-      writeFileToSDCard("/clockfaceconf", "1");
-    }  
-
-    server.send(200, "text/html", "Clock face variable set. Restarting...");
+    String val = server.arg("radio");
+    if (val == "0" || val == "1") {
+      writeFileToSDCard("/clockfaceconf", val);
+    }
+    server.send_P(200, "text/html", RESTART_HTML);
     delay(1000);
     ESP.restart();
   } else {
@@ -462,25 +448,32 @@ void handleSetTimeSetting() {
   t.Hour = static_cast<uint8_t>(server.arg("hour").toInt());
   t.Minute = static_cast<uint8_t>(server.arg("minute").toInt());
   t.Second = static_cast<uint8_t>(server.arg("second").toInt());
-  rtc.set(makeTime(t));     // update RTC chip time on UI
-  setISRTimeVar(makeTime(t));
+  // Web UI accepts local time; convert to UTC before storing so RTC always holds UTC
+  time_t utcTime = euCET.toUTC(makeTime(t));
+  rtc.set(utcTime);
+  setISRTimeVar(utcTime);
   server.sendHeader("Location", "/");
-  server.send(302, "text/plain", ""); // empty body for 302 response
-  Serial.println("RTC was updated by user input");
+  server.send(302, "text/plain", "");
+  Serial.println("RTC was updated by user input (converted local to UTC)");
 }
 
 // handler function for wifi credentials
 void handleWifiCredsSetting() {
   if(hasSD)
   {
-    String wifiCreds = server.arg("wifissid")+":"+ server.arg("wifipasswd");
+    String wifiCreds = server.arg("wifissid") + ":" + server.arg("wifipasswd");
     writeFileToSDCard("/wificonf", wifiCreds);
-    server.send(200, "text/html", "Wifi credentials changed. Restarting...");
+    server.send_P(200, "text/html", RESTART_HTML);
     delay(1000);
     ESP.restart();
   } else {
     server.send(200, "text/html", "No SD card!");
   }
+}
+
+// handler function for OTA update page
+void handleOtaPage() {
+  server.send_P(200, "text/html", OTA_HTML);
 }
 
 // read the first line of the given file

@@ -12,3 +12,4 @@ void incrementTime();
 void handleClockFaceSetting();
 void handleSetTimeSetting();
 void handleWifiCredsSetting();
+void handleOtaPage();

@@ -43,6 +43,7 @@
 #define AMBIENT_LIGHT_MEASUREMENT_COUNT 50
 
 #define WIFI_WAIT_TIMEOUT_MILLISEC 10000
+#define RTC_RESYNC_INTERVAL_MILLISEC 60000  // re-read the RTC register this often to correct for any missed 1Hz ticks
 
 // global variables
 CLOCK_FACE clockFace;
@@ -61,6 +62,7 @@ unsigned char weekDays[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Th
 float internalTimeSecs = 0 * 3600 + 0 * 60 + 0;
 bool wifiLedState = false;
 bool hasSD = true;
+bool lightSensorEnabled = true;
 unsigned long previousWifiLedMillis = 0;
 volatile time_t isrCurrentTime;
 
@@ -90,13 +92,14 @@ void handleClockFaceSetting();
 void handleSetTimeSetting();
 void handleWifiCredsSetting();
 void handleOtaPage();
+void handleLightSensorSetting();
 String readFile(String fileName);
 void writeFileToSDCard(String filename, String content);
 time_t getISRTimeVar();
 void setISRTimeVar(time_t t);
 bool initSDCard();
 void initDisplay();
-void incrementTime();
+void IRAM_ATTR incrementTime();
 
 // The setup function where tasks are created
 void setup() {
@@ -160,8 +163,18 @@ void clockTask(void *pvParameters) {
   // init display and draw sprites
   initDisplay();
 
+  unsigned long lastRtcResync = 0;
+
   // start running clock updater
   for (;;) {
+    // periodically re-sync isrCurrentTime straight from the RTC's own register, independent
+    // of WiFi/NTP, so any 1Hz interrupt ticks missed along the way don't accumulate as drift
+    unsigned long nowMillis = millis();
+    if (nowMillis - lastRtcResync >= RTC_RESYNC_INTERVAL_MILLISEC) {
+      setISRTimeVar(rtc.get());
+      lastRtcResync = nowMillis;
+    }
+
     // isrCurrentTime holds UTC; convert to local time so DST is always applied correctly
     time_t localNow = euCET.toLocal(getISRTimeVar());
     actualRTCTime.Hour = hour(localNow);
@@ -200,6 +213,7 @@ void wifiTask(void *pvParameters) {
   server.on("/settime", handleSetTimeSetting);
   server.on("/setwificreds", handleWifiCredsSetting);
   server.on("/ota", handleOtaPage);
+  server.on("/lightsensor", handleLightSensorSetting);
 
   // start mDNS responder
   MDNS.begin("wificlock");
@@ -231,20 +245,24 @@ void lightTask(void *pvParameters) {
   Serial.println(F("BH1750 initialized."));
 
   for (;;) {
-    float lightLevel = lightMeter.readLightLevel();
-    Serial.print("Light: ");
-    Serial.print(lightLevel);
-    Serial.println(" lx");
-    updateLightMeasurements(lightLevel);
-    float avgLightLevel = getAverageLightLevel();
-    Serial.print("Average Light: ");
-    Serial.print(avgLightLevel);
-    Serial.println(" lx");
+    if (lightSensorEnabled) {
+      float lightLevel = lightMeter.readLightLevel();
+      Serial.print("Light: ");
+      Serial.print(lightLevel);
+      Serial.println(" lx");
+      updateLightMeasurements(lightLevel);
+      float avgLightLevel = getAverageLightLevel();
+      Serial.print("Average Light: ");
+      Serial.print(avgLightLevel);
+      Serial.println(" lx");
 
-    if (avgLightLevel >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM) {
-      digitalWrite(LCD_BL_PIN, HIGH);
+      if (avgLightLevel >= AMBIENT_LIGHT_TRESHOLD_MAXIMUM) {
+        digitalWrite(LCD_BL_PIN, HIGH);
+      } else {
+        digitalWrite(LCD_BL_PIN, LOW);
+      }
     } else {
-      digitalWrite(LCD_BL_PIN, LOW);
+      digitalWrite(LCD_BL_PIN, HIGH);
     }
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
@@ -308,6 +326,12 @@ bool initSDCard() {
       Serial.println("Error: Wifi credential must be in 'SSID:PASSWORD' format!");
     }
   }
+
+  // read ambient light sensor watch setting
+  String lightSensorSetting = readFile("/lightsensorconf");
+  if (lightSensorSetting != "") {
+    lightSensorEnabled = lightSensorSetting.toInt() != 0;
+  }
   return true;
 }
 
@@ -359,7 +383,16 @@ void initDisplay() {
 void startWifiAPMode() {
   Serial.println("Starting Wifi in AP mode...");
   WiFi.mode(WIFI_AP);                                       // start Wifi in Access Point mode
-  WiFi.softAP(hostName, "da3EcI5G198lCdzak35", 1, 1, 2);    // set AP SSID and password
+
+  // build SSID as "WifiClock-XXXX" using the last 2 bytes of the AP's MAC address
+  uint8_t mac[6];
+  WiFi.softAPmacAddress(mac);
+  char apSSID[20];
+  snprintf(apSSID, sizeof(apSSID), "WifiClock-%02X%02X", mac[4], mac[5]);
+
+  WiFi.softAP(apSSID, "da3EcI5G198lCdzak35", 1, 0, 2);      // set AP SSID and password
+  Serial.print("AP SSID: ");
+  Serial.println(apSSID);
 }
 
 // blink built-in blue led to indicate Wifi is established in STA mode
@@ -420,6 +453,7 @@ void handleRoot() {
   html.replace("%MINUTE%", String(minute(localNow)));
   html.replace("%SECOND%", String(second(localNow)));
   html.replace("%SSID%",   wifiSSID);
+  html.replace("%LSCHK%",  lightSensorEnabled ? "checked" : "");
   server.send(200, "text/html", html);
 }
 
@@ -466,6 +500,19 @@ void handleWifiCredsSetting() {
     server.send_P(200, "text/html", RESTART_HTML);
     delay(1000);
     ESP.restart();
+  } else {
+    server.send(200, "text/html", "No SD card!");
+  }
+}
+
+// handler function for ambient light sensor watch setting
+void handleLightSensorSetting() {
+  if(hasSD)
+  {
+    lightSensorEnabled = server.hasArg("enabled");
+    writeFileToSDCard("/lightsensorconf", lightSensorEnabled ? "1" : "0");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
   } else {
     server.send(200, "text/html", "No SD card!");
   }
@@ -562,7 +609,7 @@ void setISRTimeVar(time_t t)
 }
 
 // RTC interrupt handler
-void incrementTime()
+void IRAM_ATTR incrementTime()
 {
     ++isrCurrentTime;
 }

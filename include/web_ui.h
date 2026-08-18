@@ -54,6 +54,10 @@ static const char ROOT_HTML[] PROGMEM =
   "<div class=r><label>SSID</label><input type=text name=wifissid value='%SSID%' placeholder='Network name'></div>"
   "<div class=r><label>Password</label><input type=password name=wifipasswd placeholder=Password></div>"
   "<input type=submit value='Save &amp; Restart'></form></div>"
+  "<div class=c><h2>Ambient Light Sensor</h2>"
+  "<form action=/lightsensor method=POST>"
+  "<div class=r><label>Enabled</label><input type=checkbox name=enabled value=1 %LSCHK%></div>"
+  "<input type=submit value=Save></form></div>"
   "<div class=c><h2>Firmware</h2>"
   "<button class=fw onclick=\"location.href='/ota'\">OTA Update&hellip;</button></div>"
   "</body></html>";
